@@ -1,9 +1,0 @@
-{
-	"OpticalData": "Data/100m_Tube8_Test1_Optical/",
-	"OpticalFileExtension": "VANTAGEOp*",
-	"DesiredFPS": 1,
-	"PlotBinarizedImages": true,
-	"PlotCentroids": true,
-	"PlotHist": false,
-	"PlotAny": true
-}

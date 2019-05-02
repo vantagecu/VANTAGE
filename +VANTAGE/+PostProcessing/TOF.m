@@ -3,25 +3,19 @@ classdef TOF
     % A class representing the Time of Flight Camera used by VANTAGE
     %
     %% Properties       
-    properties (Access = private)
-        %
+    properties (Access = public)
+
         % Maximum range within which TOF data is considered valid, m
         maxAllowableRange
         
-        % The transform class used for frame changes
-        % @see Transform
-        Transform
-        
         % Maximum allowed distance from a plane to be considered part of the plane
         ptMaxDistFromPlane
-        
-        % Truth data struct
-        Truth_VCF
         
         % Face length matching tolerance, for use in centroid1 method
         faceLenMatchTol = 0.02; % m
 
         % Reference to Model class
+        % @type Model
         ModelRef
         
         % fps
@@ -53,37 +47,49 @@ classdef TOF
         %
         % @return     A reference to an initialized TOF object
         %
-        function obj = TOF(ModelRef,configFilename)
+        function this = TOF(ModelRef,configFilename)
             % Clear persistents
-            clear obj.associateCentroids
+            clear this.associateCentroids
             
             % Store Model class reference
-            obj.ModelRef = ModelRef;
+            this.ModelRef = ModelRef;
 
             % Read data from configuration file
             configData = jsondecode(fileread(configFilename));
 
             % Initialize configuration parameters
-            obj.maxAllowableRange  = configData.maxAllowableRange; % m
-            obj.ptMaxDistFromPlane = configData.ptMaxDistFromPlane; % m
-            obj.fps                = configData.fps;
-            obj.HVfov_deg          = configData.HVfov_deg; % deg
+            this.maxAllowableRange  = configData.maxAllowableRange; % m
+            this.ptMaxDistFromPlane = configData.ptMaxDistFromPlane; % m
+            this.fps                = configData.fps;
+            this.HVfov_deg          = configData.HVfov_deg; % deg
             
             % Obtain truth data from Model
-            if ~isa(obj.ModelRef,'VANTAGE.PostProcessing.Model')
+            if ~isa(this.ModelRef,'VANTAGE.PostProcessing.Model')
                 error('Model input to TOF class object constructor must be a VANTAGE.PostProcessing.Model handle')
             end
-            obj.Truth_VCF = obj.ModelRef.Truth_VCF;
-            
-            % Obtain transform instance from Model
-            obj.Transform = obj.ModelRef.Transform;
         end
 
         %% Getters
         %
         % Returns the maxAllowableRange
-        function [maxAllowableRange] = getMaxAllowableRange(obj)
-            maxAllowableRange = obj.maxAllowableRange;
+        function [maxAllowableRange] = getMaxAllowableRange(this)
+            maxAllowableRange = this.maxAllowableRange;
+        end
+        
+        % Returns the TOF weight given a predicted mean range of cubesats
+        %
+        % @param    predMeanRange   predicted mean range of CubeSats, m
+        %
+        % @return   current TOF weight for sensor fusion
+        %
+        % @author   Joshua Kirby
+        % @date     07-Apr-2019
+        function [sigmaTOF] = TofWeighting(this,predMeanRange)
+            if predMeanRange <= this.ModelRef.Optical.rangeStart
+                sigmaTOF = 1;
+            else
+                sigmaTOF = interp1([this.ModelRef.Optical.rangeStart 100],[1,0.1],predMeanRange,'linear','extrap');
+            end
         end
         
         %% TOF Processing
@@ -100,22 +106,23 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     01-Mar-2019
-        function [Deployer] = TOFProcessing(obj,SensorData,Deployer,varargin)
+        function [Deployer] = TOFProcessing(this,SensorData,Deployer,varargin)
             % Extract relevant data from inputs
             CubeSats = Deployer.CubesatArray;
             
             % Obtain filenames from SensorData TOFData dir
-            ls = dir(SensorData.TOFData);
+            ls = dir([SensorData.TOFData '*.pcd']);
             ls = ls([ls.bytes]~=0);
             % Error check data against truth
-            if length(obj.Truth_VCF.t) < length(ls)
+            if length(this.ModelRef.Truth_VCF.t) < length(ls)
                 error('There are more data files than truth data points')
             end
             % Calculate timestamps
-            warning('Verify that the current method of obtaining timestamps works for real data')
+            filenames = strings(1,length(ls));
             for i = 1:length(ls)
-                ls(i).time = i*1/obj.fps;
+                filenames(i) = string(ls(i).name);
             end
+            time = this.ModelRef.TimeMan.VantageTime(filenames,'TOF',this.ModelRef.Deployer.testScenario);
             
             % Initialize varargin mutable parameters
             fileLims = [1,length(ls)];
@@ -148,7 +155,7 @@ classdef TOF
                     if strcmpi(varargin{i},'showDebugPlots')
                         if length(varargin{i+1}) == 1
                             if varargin{i+1}
-                                obj.showDebugPlots = varargin{i+1};
+                                this.showDebugPlots = varargin{i+1};
                             end
                         else
                             error('showDebugPlots requires a following 1x1 argument that is convertible to logical')
@@ -164,31 +171,35 @@ classdef TOF
             centroidingDevolved = 0;
             numConsOutliers = zeros(1,length(CubeSats));
             ii = fileLims(1);
+            count = 0;
             while ~stopProcessing
+                count = count+1;
+                if count == 76
+                end
                 % Initialize (disposable) CubeSats_TOF
                 for i = 1:length(CubeSats)
                     CubeSats_TOF(i) = VANTAGE.PostProcessing.CubeSat_TOF(CubeSats(i));
                 end
                 % Naively identify centroids in image
-                [CubeSats_TOF,pc] = obj.naiveFindCentroids(ls(ii).name,ls(ii).time,SensorData,CubeSats_TOF);
+                [CubeSats_TOF,pc] = this.naiveFindCentroids(ls(ii).name,time(ii),SensorData,CubeSats_TOF);
                 % Determine if CubeSats are passing out of range
-                if mean(pc.Location(:,3)) > obj.maxAllowableRange
+                if mean(pc.Location(:,3)) > this.maxAllowableRange
                     disp(['Mean of the analyzed point cloud passed out of the ',...
                         'maxAllowableRange for the TOF, this will be the last file',...
                         ' analyzed...']);
                     outOfRange = 1;
                 end
                 % Associate with known cubesats within Deployer
-                [CubeSats,numConsOutliers] = obj.associateCentroids(CubeSats_TOF,CubeSats,numConsOutliers);
+                [CubeSats,numConsOutliers] = this.associateCentroids(CubeSats_TOF,CubeSats,numConsOutliers,SensorData);
                 % Determine if all of the CubeSats have too many
                 % consecutive outliers
-                if ~any(numConsOutliers < obj.maxConsOutliers)
+                if ~any(numConsOutliers < this.maxConsOutliers)
                     centroidingDevolved = 1;
                 end
                 % Present Results
                 if presentResults
-                    obj.plotResults(CubeSats,CubeSats_TOF,...
-                        pc,obj.Truth_VCF.t(ii),numConsOutliers);
+                    this.plotResults(CubeSats,CubeSats_TOF,...
+                        pc,time(ii),numConsOutliers);
                 end
                 % Iterate counter
                 ii = ii + 1;
@@ -200,7 +211,9 @@ classdef TOF
                         CubeSats(ii).numTOFpoints = length(CubeSats(ii).time);
                         % Determine the final 3D fit model to the TOF data,
                         % used for propagation
-                        CubeSats(ii).TOFfit = obj.produceFinalTOFfit(CubeSats(ii));
+                        CubeSats(ii).TOFfit_VCF = this.produceFinalTOFfit(CubeSats(ii));
+                        % Save range over which TOF centroiding was used
+                        CubeSats(ii).TOFrange   = [min(vecnorm(CubeSats(ii).centroids_VCF,2)) max(vecnorm(CubeSats(ii).centroids_VCF,2))];
                     end
                     stopProcessing = 1;
                 end
@@ -229,13 +242,12 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     04-Mar-2019
-        function [CubeSats_TOF,pc] = naiveFindCentroids(obj,filename,time,SensorData,CubeSats_TOF)
+        function [CubeSats_TOF,pc] = naiveFindCentroids(this,filename,time,SensorData,CubeSats_TOF)
             % Extract point cloud locations
             filename = strcat(SensorData.TOFData,filename);
             
             % Load point cloud from file
-            warning('Load script is currently only designed to work with simulated .pcd files')
-            pc = obj.loadSimFile(filename);
+            pc = this.loadPcFile(filename);
             for i = 1:length(CubeSats_TOF)
                 CubeSats_TOF(i).time = time;
             end
@@ -243,17 +255,17 @@ classdef TOF
             % Only proceed if the point cloud is valid
             if ~isempty(pc.XLimits)
                 % Separate point cloud into identified cubesats
-                [obj,CubeSats_TOF] = obj.cubesatPointsFromPC(pc,CubeSats_TOF);
+                [this,CubeSats_TOF] = this.cubesatPointsFromPC(pc,CubeSats_TOF);
 
                 for i = 1:length(CubeSats_TOF)
                     % If a point cloud was found for this cubesat
                     if ~isempty(CubeSats_TOF(i).pc)
                         % Identify visible planes for each cubesat
-                        CubeSats_TOF(i) = obj.fitPlanesToCubesat(CubeSats_TOF(i));
+                        CubeSats_TOF(i) = this.fitPlanesToCubesat(CubeSats_TOF(i));
 
                         % Calculate centroids by projecting from identified planes
                         if CubeSats_TOF(i).trustedSat
-                            CubeSats_TOF(i) = obj.findCentroidFromFaces(CubeSats_TOF(i));
+                            CubeSats_TOF(i) = this.findCentroidFromFaces(CubeSats_TOF(i));
                         end
                     end
                 end
@@ -278,12 +290,16 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     10-Mar-2019
-        function [CubeSats,numConsOutliers] = associateCentroids(obj,CubeSats_TOF,CubeSats,numConsOutliers)
+        function [CubeSats,numConsOutliers] = associateCentroids(this,CubeSats_TOF,CubeSats,numConsOutliers,SensorData)
+            try
             % Define persistent variable to save whether the last file
             % contained outliers for each CubeSat
             persistent hadOutlier
             if isempty(hadOutlier)
                 hadOutlier = zeros(1,length(CubeSats));
+            end
+            if ~strcmpi(this.ModelRef.Deployer.testScenario,'Simulation')
+                hadOutlier = hadOutlier(1:length(CubeSats));
             end
             hasOutlier = false(1,length(CubeSats));
             firstNmeas = 10;
@@ -292,13 +308,16 @@ classdef TOF
             % Transform naive centroids to VCF
             centroid_VCF = zeros(3,length(CubeSats_TOF));
             for ii = ItofFoundCentroids
-                centroid_VCF(:,ii) = obj.Transform.tf('VCF',CubeSats_TOF(ii).centroid_TCF,'TCF');
+                centroid_VCF(:,ii) = this.ModelRef.Transform.tf('VCF',CubeSats_TOF(ii).centroid_TCF,'TCF');
             end
             % Only proceed if some centroids were found
             if any(ItofFoundCentroids)
                 % Ensure range ordering (first-out to last-out) of newly identified centroids
                 tmp = [CubeSats_TOF(ItofFoundCentroids).centroid_TCF];
                 [~,Irngorder] = sort(tmp(3,:),'descend');
+                static_Irngorder = Irngorder;
+                Irngorder = ItofFoundCentroids(Irngorder);
+                static_centroid_VCF = centroid_VCF;
                 centroid_VCF = centroid_VCF(:,Irngorder);
                 % Determine which CubeSats already have firstNmeas measurements
                 IsatsWithEnoughMeas = find(cellfun(@length,{CubeSats.time})>=firstNmeas);
@@ -308,8 +327,12 @@ classdef TOF
                 if numel(IsatsWithEnoughMeas) < length(CubeSats)
                     ItofUsedCentroids = setdiff(ItofFoundCentroids,IsatsWithEnoughMeas);
                     for ii = ItofUsedCentroids
-                        CubeSats(ii).centroids_VCF = [CubeSats(ii).centroids_VCF,centroid_VCF(:,ii)];
-                        CubeSats(ii).time = [CubeSats(ii).time,CubeSats_TOF(ii).time];
+                        try
+                        CubeSats(ii).centroids_VCF = [CubeSats(ii).centroids_VCF,centroid_VCF(:,ii==Irngorder)];
+                        catch
+                            h=1;
+                        end
+                        CubeSats(ii).time = [CubeSats(ii).time,CubeSats_TOF(ii==Irngorder).time];
                     end
                 end
                 % Obtain predicted point and outlierThresholds for each
@@ -322,8 +345,8 @@ classdef TOF
                 stdXYZ = zeros(3,length(CubeSats));
                 for ii = IsatsWithEnoughMeas
                     [pX(ii,:),pY(ii,:),pZ(ii,:),stdXYZ(:,ii)] = ...
-                        obj.fitLineToCentroids(CubeSats(ii),firstNmeas);
-                    outlierThreshold(:,ii) = obj.outlierMultiplier*stdXYZ(:,ii);
+                        this.fitLineToCentroids(CubeSats(ii),firstNmeas);
+                    outlierThreshold(:,ii) = this.outlierMultiplier*stdXYZ(:,ii);
                     predPt(:,ii) = [polyval(pX(ii,:),CubeSats_TOF(1).time),...
                               polyval(pY(ii,:),CubeSats_TOF(1).time),...
                               polyval(pZ(ii,:),CubeSats_TOF(1).time)]';
@@ -423,6 +446,13 @@ classdef TOF
                             meanResNorm(ii) = mean(vecnorm([extractedPossibleSats(ii,:).resFromPredPt],2,1));
                         end
                         [~,Imin] = min(meanResNorm);
+                        
+                        %%%%%%%%%%%%%%%%%%%%%
+                        %{
+                        if Imin > this.ModelRef.Deployer.numCubesats
+                            Imin = this.ModelRef.Deployer.numCubesats;
+                        end
+                        %}
                         % save the minimum mean norm residual
                         for ii = 1:length(extractedCombsSats(Imin,:))
                             CubeSats(extractedCombsSats(Imin,ii)).centroids_VCF = ...
@@ -447,6 +477,7 @@ classdef TOF
                         meanResNorm(ii) = nanmean(resNorm(ii,:));
                     end
                     [~,Imin] = nanmin(meanResNorm);
+                    
                     satsSaved = [];
                     for ii = 1:size(possibleCubesats,2)
                         if ~possibleCubesats(Imin,ii).isOutlier
@@ -466,6 +497,9 @@ classdef TOF
                 numConsOutliers = hadOutlier.*numConsOutliers + hasOutlier;
                 hadOutlier = hasOutlier;
             end
+            catch
+                disp('fuuuuck')
+            end
         end
         
     end
@@ -482,7 +516,7 @@ classdef TOF
         %
         % @author       Joshua Kirby
         % @date         24-Jan-2019
-        function pc = loadSimFile(obj,filename)
+        function pc = loadPcFile(this,filename)
             ptCloud = pcread(filename);
             if nnz(~isnan(ptCloud.Location))==0
                 pc = pointCloud(nan(1,3));
@@ -492,26 +526,22 @@ classdef TOF
                 I = logical(prod(~isnan(pts),2));
                 pc = pointCloud(pts(I,:));
             end
-            if obj.showDebugPlots % useful for debugging
+            if strcmpi(this.ModelRef.Deployer.testScenario,'Modular') || strcmpi(this.ModelRef.Deployer.testScenario,'100m')
+                % Scale mm to m
+                xyzPoints = pc.Location./1000;
+                pc = pointCloud(xyzPoints);
+            elseif strcmpi(this.ModelRef.Deployer.testScenario,'simulation')
+                % do nothing
+            else
+                error('testType is invalid, must be ''100m'', ''Modular'', or ''Simulation''')
+            end
+            if this.showDebugPlots % useful for debugging
                 figure            
                 pcshow(pc)
                 xlabel('x')
                 ylabel('y')
                 zlabel('z')
             end
-        end
-        
-        %
-        % Loads experimental data from a VANTAGE TOF file
-        %
-        % @param	filename    filename, string
-        %
-        % @return	point cloud obtained from file
-        %
-        % @author       Joshua Kirby
-        % @date         24-Jan-2019
-        function pc = loadExpData(filename)
-            error('unimplemented')
         end
         
         %% Identifying cubesats within point clouds
@@ -530,7 +560,7 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function [obj,CubeSats_TOF] = cubesatPointsFromPC(obj,pc,CubeSats_TOF)
+        function [this,CubeSats_TOF] = cubesatPointsFromPC(this,pc,CubeSats_TOF)
             % Pull out z values
             z = sort(pc.Location(:,3));
 
@@ -560,7 +590,7 @@ classdef TOF
                 break
               end
             end
-            if obj.showDebugPlots % useful for debugging
+            if this.showDebugPlots % useful for debugging
                 figure
                 hold on
                 grid on
@@ -591,11 +621,11 @@ classdef TOF
                 % Skip this CubeSat if it's too close to the edge of the
                 % FOV
                 maxZfov = max(...
-                    max(abs(pc.Location(I,1)))/tand(obj.HVfov_deg(1)/2),...
-                    max(abs(pc.Location(I,2)))/tand(obj.HVfov_deg(2)/2)...
+                    max(abs(pc.Location(I,1)))/tand(this.HVfov_deg(1)/2),...
+                    max(abs(pc.Location(I,2)))/tand(this.HVfov_deg(2)/2)...
                     );
-                satPcZDistFromFOV = min(pc.Location(I,3)-abs(pc.Location(I,1))./tand(obj.HVfov_deg(1)/2),...
-                                    pc.Location(I,3)-abs(pc.Location(I,2))./tand(obj.HVfov_deg(2)/2));
+                satPcZDistFromFOV = min(pc.Location(I,3)-abs(pc.Location(I,1))./tand(this.HVfov_deg(1)/2),...
+                                    pc.Location(I,3)-abs(pc.Location(I,2))./tand(this.HVfov_deg(2)/2));
                 % skip if first percentile of data is less than two cm from
                 % the FOV --and-- if the 99th percentile of data is less
                 % than 20 cm from the highest point of the FOV directly
@@ -621,11 +651,11 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function [CubeSat_TOF] = fitPlanesToCubesat(obj,CubeSat_TOF)
+        function [CubeSat_TOF] = fitPlanesToCubesat(this,CubeSat_TOF)
             %%% Allocation
             % Initial value for minimum number of points considered to make up a plane
             minPtsInPlane   = 10;
-            minPtsUnset     = 1;
+            minPtsUnset     = true;
 
             % Initialize planes structure
             numPlanes = 0;
@@ -638,7 +668,7 @@ classdef TOF
             while remainPtCloud.Count > minPtsInPlane
                 %%% Fit a plane to the ptCloud
                 warning('off','vision:pointcloud:notEnoughInliers')
-                [~,inlierIndices,outlierIndices] = pcfitplane(remainPtCloud,obj.ptMaxDistFromPlane);
+                [~,inlierIndices,outlierIndices] = pcfitplane(remainPtCloud,this.ptMaxDistFromPlane);
                 warning('on','vision:pointcloud:notEnoughInliers')
                 
                 %%% Quit now if no significant planes found
@@ -658,7 +688,7 @@ classdef TOF
                 remainPtCloud = select(remainPtCloud,outlierIndices);
                 
                 %%% Obtain planar basis
-                [planes(numPlanes).n,planes(numPlanes).V,planes(numPlanes).o] = obj.affine_fit(double(planes(numPlanes).planeCloud.Location));
+                [planes(numPlanes).n,planes(numPlanes).V,planes(numPlanes).o] = this.affine_fit(double(planes(numPlanes).planeCloud.Location));
                 
                 %%% Remove if repeat plane (e.g. if this is the cubesat 'feet')
                 % For all previous planes
@@ -687,13 +717,14 @@ classdef TOF
                 % plane
                 if numPlanes == 1 && minPtsUnset
                     minPtsInPlane = round(planes(numPlanes).planeCloud.Count/20);
-                    minPtsUnset   = 0;
+                    minPtsUnset   = false;
                 end
             end
 
             %%% Check that no more than three planes were identified
             if numPlanes > 3
-              error('fitPlanesToCubesat identified more than three planes for a single cubesat')
+              %error('fitPlanesToCubesat identified more than three planes for a single cubesat')
+              CubeSat_TOF.trustedSat = 0;
             end
 
             %%% Check that planes are mutually orthogonal
@@ -701,7 +732,7 @@ classdef TOF
                 for j = 1:numPlanes
                     if abs(asind(dot(planes(i).n,planes(j).n))) > 8 && i~=j
                         %CubeSat_TOF.trustedSat = 0;
-                        warning('fitPlanesToCubesat identified planes which are not mutually orthogonal by greater than 8 deg')
+                        %warning('fitPlanesToCubesat identified planes which are not mutually orthogonal by greater than 8 deg')
                     end
                 end
             end
@@ -724,14 +755,14 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function [CubeSat] = findCentroidFromFaces(obj,CubeSat)
+        function [CubeSat] = findCentroidFromFaces(this,CubeSat)
             % Find centroid based on number of identified faces
             if CubeSat.numVisibleFaces==1
-                CubeSat = obj.centroid1(CubeSat);
+                CubeSat = this.centroid1(CubeSat);
             elseif CubeSat.numVisibleFaces==2
-                CubeSat = obj.centroid2(CubeSat);
+                CubeSat = this.centroid2(CubeSat);
             elseif CubeSat.numVisibleFaces==3
-                CubeSat = obj.centroid3(CubeSat);
+                CubeSat = this.centroid3(CubeSat);
             end
         end
         
@@ -748,12 +779,12 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function CubeSat_TOF = centroid1(obj,CubeSat_TOF)
+        function CubeSat_TOF = centroid1(this,CubeSat_TOF)
             %%% Find plane boundary points and centroid
-            [CubeSat_TOF.faces] = obj.getFaceCentroidAndCorners(CubeSat_TOF.faces);
+            [CubeSat_TOF.faces] = this.getFaceCentroidAndCorners(CubeSat_TOF.faces);
             
             %%% Identify face corners using bounding box of face
-            [CubeSat_TOF] = obj.diagnoseFace(CubeSat_TOF);
+            [CubeSat_TOF] = this.diagnoseFace(CubeSat_TOF);
             
             %%% Extract data
             face = CubeSat_TOF.faces;
@@ -783,7 +814,7 @@ classdef TOF
                 % Obtain projection direction from farMidPt orthogonal to corners and
                 % towards the face interior
                 midPtToInterior = face.faceCentr - farMidPt;
-                projHat = obj.unitvec( cross(nhat,relCorner) );
+                projHat = this.unitvec( cross(nhat,relCorner) );
                 projHat = sign( dot(projHat,midPtToInterior) ) * projHat;
                 
                 % Project from farMidPt to the desired face centroid
@@ -791,7 +822,7 @@ classdef TOF
             end
             
             %%% Project inward to volumetric centroid
-            d = obj.distInFromFace(CubeSat_TOF,face.faceIndex);
+            d = this.distInFromFace(CubeSat_TOF,face.faceIndex);
             CubeSat_TOF.centroid_TCF = centr + d*sign(dot(centr,face.n))*face.n;
         end
         
@@ -808,7 +839,7 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function CubeSat_TOF = centroid2(obj,CubeSat_TOF)
+        function CubeSat_TOF = centroid2(this,CubeSat_TOF)
             %%% Check that planes intersect as expected
             if rank([CubeSat_TOF.faces.n]) ~= 2
                 error('The two planes identified do not intersect as a line')
@@ -816,8 +847,8 @@ classdef TOF
             
             %%% Find faces' centroids and corners
             %%%     and determine if each face qualifies as a fullFace
-            CubeSat_TOF.faces = obj.getFaceCentroidAndCorners(CubeSat_TOF.faces);
-            CubeSat_TOF = obj.diagnoseFace(CubeSat_TOF);
+            CubeSat_TOF.faces = this.getFaceCentroidAndCorners(CubeSat_TOF.faces);
+            CubeSat_TOF = this.diagnoseFace(CubeSat_TOF);
             
             %%% Extract data
             faces = CubeSat_TOF.faces;
@@ -852,7 +883,7 @@ classdef TOF
                 % ensure that unit normals are inward facing
                 n(:,i) = sign(dot(meanpt,faces(i).n))*faces(i).n;
                 % calculate orthogonal distance from each face to the centroid
-                d(i) = obj.distInFromFace(CubeSat_TOF,faces(i).faceIndex);
+                d(i) = this.distInFromFace(CubeSat_TOF,faces(i).faceIndex);
             end
             % Project to centroid
             CubeSat_TOF.centroid_TCF = meanpt + sum(d.*n,2);
@@ -871,11 +902,11 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     03-Feb-2019
-        function CubeSat_TOF = centroid3(obj,CubeSat_TOF)
+        function CubeSat_TOF = centroid3(this,CubeSat_TOF)
             %%% Find faces' centroids and corners
             %%%     and determine if each face qualifies as a fullFace
-            CubeSat_TOF.faces = obj.getFaceCentroidAndCorners(CubeSat_TOF.faces);
-            CubeSat_TOF = obj.diagnoseFace(CubeSat_TOF);
+            CubeSat_TOF.faces = this.getFaceCentroidAndCorners(CubeSat_TOF.faces);
+            CubeSat_TOF = this.diagnoseFace(CubeSat_TOF);
             
             %%% Extract data
             faces = CubeSat_TOF.faces;
@@ -899,7 +930,7 @@ classdef TOF
                 % ensure that unit normals are inward facing
                 n(:,i) = sign(dot(ptIntersect,faces(i).n))*faces(i).n;
                 % calculate orthogonal distance from each face to the centroid
-                d(i) = obj.distInFromFace(CubeSat_TOF,faces(i).faceIndex);
+                d(i) = this.distInFromFace(CubeSat_TOF,faces(i).faceIndex);
             end
             % Orthogonalize n
             [Q,R] = qr(n);
@@ -920,7 +951,7 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     07-Mar-2019
-        function [faces] = getFaceCentroidAndCorners(obj,faces)
+        function [faces] = getFaceCentroidAndCorners(this,faces)
             for ii = 1:length(faces)
                 face = faces(ii);
                 %%% Project points onto 2d plane
@@ -933,7 +964,7 @@ classdef TOF
                 %%% Find filtered boundary
                 boundaryPtsRaw = [inPlane(I_bound,1)';inPlane(I_bound,2)'];
                 order = 2;
-                frameLen = obj.roundToNearestOdd(size(boundaryPtsRaw,2)/5);
+                frameLen = this.roundToNearestOdd(size(boundaryPtsRaw,2)/5);
                 if frameLen <= 1
                     boundaryPts = boundaryPtsRaw;
                 else
@@ -946,7 +977,7 @@ classdef TOF
                 face.faceCentr = face.o + face.V * [x;y];
 
                 % Find face boundary in face plane
-                corners_inPlane = obj.minBoundingBox(boundaryPts);
+                corners_inPlane = this.minBoundingBox(boundaryPts);
                 % Convert to 3D
                 face.corners = zeros(3,4);
                 for i = 1:4
@@ -970,7 +1001,7 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     07-Mar-2019
-        function [CubeSat_TOF] = diagnoseFace(obj,CubeSat_TOF)
+        function [CubeSat_TOF] = diagnoseFace(this,CubeSat_TOF)
             %%% for all faces
             for ii = 1:length(CubeSat_TOF.faces)
                 % Extract data
@@ -986,7 +1017,7 @@ classdef TOF
                 for i = 1:2
                     len(i) = norm(corners(:,i+1) - corners(:,i));
                     deltaLen(:,i) = abs(len(i) - CubeSat_TOF.actualDims);
-                    faceMatches{i} = find(deltaLen(:,i) < obj.faceLenMatchTol);
+                    faceMatches{i} = find(deltaLen(:,i) < this.faceLenMatchTol);
                 end
                 % For fullFace, both sides must have a length match
                 fullFaceCondition = ~isempty(faceMatches{1}) & ~isempty(faceMatches{2});
@@ -1051,7 +1082,7 @@ classdef TOF
                     % Project through near bad corners to near corners
                     nearCorners = zeros(3,2);
                     for i = 1:2
-                        u = obj.unitvec(nearBadCorners(:,i) - farCorners(:,i));
+                        u = this.unitvec(nearBadCorners(:,i) - farCorners(:,i));
                         nearCorners(:,i) = farCorners(:,i) + projLength*u;
                     end
 
@@ -1151,29 +1182,30 @@ classdef TOF
         % @param    CubeSats_TOF    array of CubeSat_TOF objects after
         %                           processing the associated point cloud
         % @param    pc              raw point cloud from file
-        % @param    truthTime       timestamp of truth data which
-        %                           corresponds to the data file whose
-        %                           results are being presented
+        % @param    time            timestamp of this point cloud in global
+        %                           VANTAGE time [s]
         %
         % @author   Joshua Kirby
         % @date     04-Mar-2019
-        function plotResults(obj,CubeSats,CubeSats_TOF,pc,truthTime,numConsOutliers)
+        function plotResults(this,CubeSats,CubeSats_TOF,pc,time,numConsOutliers)
             
             % Define indexing for use in looping over cubesats
             CubesatIndexing = 1:length(CubeSats);
             
-            I = find(obj.Truth_VCF.t == truthTime,1);
-            for i = 1:obj.Truth_VCF.numCubeSats
-                % Extract true centroids from truth data for this file
-                trueCentroids_VCF(i,:) = obj.Truth_VCF.Cubesat(i).pos(I,:);
+            % Get truth data at the current time
+            trueCentroids_VCF = zeros(this.ModelRef.Truth_VCF.numCubeSats,3);
+            for i = 1:this.ModelRef.Truth_VCF.numCubeSats
+                trueCentroids_VCF(i,:) = interp1(this.ModelRef.Truth_VCF.t,...
+                                                 this.ModelRef.Truth_VCF.Cubesat(i).pos,...
+                                                 time,[],'extrap');
             end
             
             % Transform true centroids from VCF to TCF
-            trueCentroids_TCF = [obj.Transform.tf('TCF',trueCentroids_VCF','VCF')]';
+            trueCentroids_TCF = [this.ModelRef.Transform.tf('TCF',trueCentroids_VCF','VCF')]';
             calcCentroids_TCF = nan(length(CubeSats),3);
             for i = 1:length(CubeSats) 
                 if ~numConsOutliers(i) && ~isempty(CubeSats(i).centroids_VCF)
-                    calcCentroids_TCF(i,:) = [obj.Transform.tf('TCF',CubeSats(i).centroids_VCF(:,end),'VCF')]';
+                    calcCentroids_TCF(i,:) = [this.ModelRef.Transform.tf('TCF',CubeSats(i).centroids_VCF(:,end),'VCF')]';
                 end
             end
             
@@ -1193,6 +1225,7 @@ classdef TOF
             % Plot results
             figure('units','normalized','position',[1/16,1/8,14/16,6/8])
             c = get(gca,'colororder');
+            c = [c;c];
             markersize = 100;
             fontsize = 20;
             legendfontsize = 16;
@@ -1211,7 +1244,6 @@ classdef TOF
             ylabel('y [m]','fontsize',legendfontsize)
             zlabel('z [m]','fontsize',legendfontsize)
             hold off
-            
             
             subplot(1,3,2)
             grid on
@@ -1358,8 +1390,8 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     06-Mar-2019
-        function y = roundToNearestOdd(obj,x)
-            y = 2*round(x/2) + obj.binarySign(x-round(x));
+        function y = roundToNearestOdd(this,x)
+            y = 2*round(x/2) + this.binarySign(x-round(x));
         end
         
         % 
@@ -1438,10 +1470,10 @@ classdef TOF
         %
         % @author   Joshua Kirby
         % @date     24-Mar-2019
-        function TOFfit = produceFinalTOFfit(~,CubeSat)
-            TOFfit{1} = fit(CubeSat.time',CubeSat.centroids_VCF(1,:)','poly1');
-            TOFfit{2} = fit(CubeSat.time',CubeSat.centroids_VCF(2,:)','poly1');
-            TOFfit{3} = fit(CubeSat.time',CubeSat.centroids_VCF(3,:)','poly1');
+        function TOFfit_VCF = produceFinalTOFfit(~,CubeSat)
+            TOFfit_VCF{1} = fit(CubeSat.time',CubeSat.centroids_VCF(1,:)','poly1');
+            TOFfit_VCF{2} = fit(CubeSat.time',CubeSat.centroids_VCF(2,:)','poly1');
+            TOFfit_VCF{3} = fit(CubeSat.time',CubeSat.centroids_VCF(3,:)','poly1');
         end
         
         

@@ -41,15 +41,13 @@ classdef Test_Optical < matlab.unittest.TestCase
         function test100mData(testCase)
             close all
             import VANTAGE.PostProcessing.*
-            truthFilename = 'config/Testing/TruthDataTest.json';
-            manifestFilename = 'Config/Manifest.json';
+            
+            addpath('./export-fig')
+            
+            manifestFilename = 'Config/Testing/Dylan/Manifest.json';
             Model = VANTAGE.PostProcessing.Model(manifestFilename,'./Config/Testing/Dylan');
-            OpticalTest = Model.Optical;
             
             Model.ComputeStateOutput;
-            
-            % Unit vector to VCF origin from CCF
-            UnitOriginVCF = Model.Deployer.GetCamOriginVCF;
         end
         
     end

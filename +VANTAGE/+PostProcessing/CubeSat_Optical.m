@@ -11,6 +11,9 @@ classdef CubeSat_Optical
         
         % Centroid pixel location
         centroid
+        
+        % Unit vector to centroid
+        unitvec
     end
     
     %% Methods
@@ -25,10 +28,11 @@ classdef CubeSat_Optical
         %
         % @return     A reference to an initialized CubeSat object
         %
-        function obj = CubeSat_Optical(tag, centroid)
+        function this = CubeSat_Optical(tag, centroid)
             if nargin == 3
-                obj.tag = tag;
-                obj.centroid = centroid;
+                this.tag = tag;
+                this.centroid = centroid;
+                this.unitvec = unitvec;
             end
         end
     end

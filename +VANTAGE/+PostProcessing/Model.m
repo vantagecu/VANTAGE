@@ -4,22 +4,31 @@ classdef Model < handle
 
     properties (SetAccess = public)
         % Deployer class
+        % @type Deployer
         Deployer
-    end
-    properties (SetAccess = protected)
-        % Transform class
-        Transform
-    end
-    properties (SetAccess = private)
-        % Optical camera class
-        Optical
-
-        % TOF camera class
-        TOF
         
         % Truth data
         Truth_VCF
+    end
+    
+    properties (SetAccess = protected)
+        % Transform class
+        % @type Transform
+        Transform
         
+        % Time Manager Class
+        % @type TimeMan
+        TimeMan
+    end
+    
+    properties (SetAccess = private)
+        % Optical camera class
+        % @type Optical
+        Optical
+
+        % TOF camera class
+        % @type TOF
+        TOF
     end
 
     methods
@@ -30,71 +39,230 @@ classdef Model < handle
         %
         % @return     A reference to an initialized Model object
         %
-        function obj = Model(manifestFilename,configDirecName)
+        function this = Model(manifestFilename,configDirecName,dataprocessing)
             
         	% Import child classes
         	import VANTAGE.PostProcessing.Deployer
         	import VANTAGE.PostProcessing.Transform
         	import VANTAGE.PostProcessing.Optical
         	import VANTAGE.PostProcessing.TOF
+            import VANTAGE.PostProcessing.TimeManager
 
-        	% Construct child classes and process truth data
-            obj.Deployer = Deployer(manifestFilename, strcat(configDirecName,'/Deployer.json'),obj);
-            obj.Truth_VCF = obj.processTruthData(obj.Deployer.TruthFileName);
-            obj.Transform = Transform(strcat(configDirecName,'/Transform.json'));
-            obj.Optical = Optical(obj,strcat(configDirecName,'/Optical.json'), obj.Deployer.GetNumCubesats());
-            obj.TOF = TOF(obj,strcat(configDirecName,'/TOF.json'));
-            
-            % Error catching
-            if obj.Deployer.numCubesats ~= obj.Truth_VCF.numCubeSats
-                error('Truth data and manifest do not agree on the number of Cubesats')
+            if dataprocessing
+                % Construct child classes and process truth data
+                % NOTE: The order of these lines is very important
+                this.Deployer = Deployer(manifestFilename, strcat(configDirecName,'/Deployer.json'),this);
+                this.Transform = Transform(strcat(configDirecName,'/Transform.json'));
+                SensorData = jsondecode(fileread(strcat(configDirecName,'/Sensors.json')));
+                this.TimeMan = TimeManager(SensorData,this.Deployer.testScenario,this);
+                this.Truth_VCF = this.processTruthData(this.Deployer.TruthFileName);
+                this.TimeMan.syncTruthData(this);
+                this.Optical = Optical(this,strcat(configDirecName,'/Optical.json'), this.Deployer.GetNumCubesats());
+                this.TOF = TOF(this,strcat(configDirecName,'/TOF.json'));
+
+                % Error catching
+                if this.Deployer.numCubesats ~= this.Truth_VCF.numCubeSats
+                    error('Truth data and manifest do not agree on the number of Cubesats')
+                end
+            else
+                this.Deployer = Deployer(manifestFilename, strcat(configDirecName,'/Deployer.json'),this);
+                SensorData = jsondecode(fileread(strcat(configDirecName,'/Sensors.json')));
+                this.TimeMan = TimeManager(SensorData,this.Deployer.testScenario,this);
+                this.Truth_VCF = this.processTruthData(this.Deployer.TruthFileName);
             end
         end
 
         % A method for looping through optical data and performing sensor fusion
         % to return a final state output
         %
-        % @param      obj   The object
+        % @param      this   The object
         %
         %
-        function obj = ComputeStateOutput(obj)
+        function [] = ComputeStateOutput(this)
         	% Get directory of optical frames
-        	[didRead,direc] = readInputFramesFromImages(obj.Optical);
+        	[didRead,direc,timestamps] = this.Optical.readInputFramesFromImages(this);
 
-            % Process last frame of optical data to find 100m pixel
-            % location
-            obj.Optical = obj.Optical.find100mPixel(direc(end));
+            [~,finalImageIndex] = max(timestamps);
+            [~,firstImageIndex] = min(timestamps);
+            
+            [~,timestampIndices]= sort(timestamps);
+            direc = direc(timestampIndices);
+            
+            if strcmpi(this.Deployer.testScenario,'Simulation')
+                timestamps_VANTAGE = timestamps;
+            else
+                timestamps_VANTAGE = this.TimeMan.VantageTime(vertcat({direc(:).name})','Optical',this.Deployer.testScenario);
+            end
+            
+            % Find time index right after TOF predicts the cubesats will be
+            % at 10m
+            t_start = fsolve(@(t) norm(this.Deployer.CubesatArray(1).evalTofFit(t)) - this.Optical.rangeStart, this.Optical.rangeStart);
+            I_start = find(timestamps_VANTAGE>t_start,1,'first');
+            t_10m = fsolve(@(t) norm(this.Deployer.CubesatArray(1).evalTofFit(t)) - 10, 10 );
+            I_10m = find(timestamps_VANTAGE>=t_10m,1,'first');
+            if isempty(I_10m)
+                I_10m = numel(direc);
+            end
+            I_stop = numel(direc);
+            if strcmpi(this.Deployer.testScenario,'Modular')
+                I_stop = I_10m-1;
+            end
+            
+            
+            % Find background pixels in first optical image for background
+            % subtraction
+            [BackgroundPixels,firstFrame] = this.Optical.FindBackground(direc(firstImageIndex));
+            
+            % Find pixel location of CubeSats in last image for object
+            % association in optical data
+            this.Optical = this.Optical.findLastImagePixel(direc(finalImageIndex),BackgroundPixels,firstFrame);
+            this.Optical.Timestamps = timestamps;
             
         	if didRead
-	        	% Loop though optical frames
-	        	for i = 1:numel(direc)
-	        		% Read frame
-	        		obj.Optical.Frame = direc(i);
+                if ~isempty(I_start) && ~isempty(I_stop)
+    	        	% Loop though optical frames
+                    n = numel(direc) - I_start;
+                    pos = cell(n,this.Deployer.GetNumCubesats());
+                    posCount = 1;
+                    for i = I_start:I_stop
+                        if posCount==202
+                        end
+    	        		% Read frame
+    	        		this.Optical.Frame = direc(i);
+                        
+                        % Get current time in VANTAGE global time [s]
+                        currentTime = timestamps_VANTAGE(i);
 
-	        		% Run optical processing
-	        		[CamUnitVecsVCF,CamOriginVCF, CamTimestamp, isSystemCentroid] =...
-                        obj.Optical.OpticalProcessing(obj.Optical.Frame);
+    	        		% Run optical processing
+    	        		[this.Optical,~, ~, isSystemCentroid] =...
+                            this.Optical.OpticalProcessing(this.Optical.Frame,BackgroundPixels,firstFrame);
 
-	        		% Get propogated TOF positions
-                    %lol
-	        		%pos_TOF = obj.TOF.propogatedShit(camTimestep)
+                        CamUnitVecsVCF = cell(numel(this.Optical.CubeSats),1);
+                        for j = 1:length(CamUnitVecsVCF)
+                            CamUnitVecsVCF{j} = this.Optical.CubeSats{j}.unitvec;
+                        end
 
-	        		% Run sensor fusion
-	        		%[pos] = RunSensorFusion(obj, isSystemCentroid, obj.Deployer.GetCamOriginVCF(), CamUnitVecsVCF, pos_TOF, sig_cam, sig_TOF);
-	        	end
+                        if strcmpi(isSystemCentroid,'invalid')
+                            continue
+                        end
+                        
+                        % Get propogated TOF positions
+                        CubeSats = this.Deployer.CubesatArray;
+                        pos_TOF = cell(numel(CubeSats),1);
+                        
+                        % pos_TOF: cell array for propagated TOF
+                        % CubeSat positions, (:,1) = CS1, (:,2) = CS2,...
+                        for j = 1:numel(CubeSats)
+                            pos_TOF{j} = CubeSats(j).evalTofFit(currentTime);
+                        end
+
+    	        		% Run sensor fusion
+    	        		pos(posCount,:) = RunSensorFusion(this, isSystemCentroid, this.Deployer.GetCamOriginVCF(), CamUnitVecsVCF, pos_TOF)';
+                        t(posCount) = currentTime;
+                        posCount = posCount + 1;
+                        %plot3(pos{i,1}(1),pos{i,1}(2),pos{i,1}(3),'*r')
+                        %drawnow
+                        %hold on
+                        this.Optical.CurrentFrameCount = this.Optical.CurrentFrameCount + 1;
+                    end
+                    %if strcmpi(this.Deployer.testScenario,'100m')
+                    %    pos = pos(1:(I_stop-I_start),1:3);
+                    %else
+                    %    pos = pos(1:(I_stop-I_start)+1,1:3);
+                    %end
+                    
+                    this.CombineResults(pos,t);
+                else
+                    % Just extrapolate TOF data to 10m
+                    n = 100;
+                    pos = cell(n,this.Deployer.GetNumCubesats());
+                    t = linspace(0,t_10m,n);
+                    for i = 1:n
+                        for j = 1:this.Deployer.GetNumCubesats()
+                            pos{i,j} = this.Deployer.CubesatArray(j).evalTofFit(t(i));
+                        end
+                    end
+                    
+                    for i = 1:this.Deployer.numCubesats
+                        this.Deployer.CubesatArray(i).centroids_VCF = pos(:,i);
+                        this.Deployer.CubesatArray(i).time = t;
+                    end
+                end
+
 	        else
-	        	error(strcat('Unable to read optical data files from ', obj.Optical.DataDirec));
+	        	error(strcat('Unable to read optical data files from ', this.Optical.DataDirec));
         	end
         end
         
-        % A method for synchronizing timestamps between the TOF and optical
-        % cameras.
+        % Combine results from ComputeStateOutput and TOF processing
         %
-        % @param      sampleparameter sampledescription
         %
-        % @return     samplereturn
-        function TimeStampSync(obj)
+        % @return   this             Updated object with centroids_VCF and
+        %                           time parameters
+        % @author   Dylan Bossie
+        % @date     11-Apr-2019
+        function [this] = CombineResults(this,pos,t)
+            CubeSats = this.Deployer.CubesatArray;
             
+            for i = 1:length(CubeSats)
+                
+                iter_t = 1;
+                iter_cs = 1;
+                counter = 1;
+                
+                CubeSat_positions = cell(length(t)+length(CubeSats(i).time),1);
+                CubeSat_times = zeros(length(t)+length(CubeSats(i).time),1);
+                
+                positions = pos(:,i);
+                % Iterate through the two sets of time values to zip
+                % together
+                while iter_t <= length(t) && iter_cs <= length(CubeSats(i).time)
+                    if t(iter_t) < CubeSats(i).time(iter_cs)
+                        % Next time to save is from pos & t
+                        CubeSat_times(counter) = t(iter_t);
+                        CubeSat_positions(counter) = positions(iter_t);
+                        iter_t = iter_t + 1;
+                        counter = counter + 1;
+                    elseif t(iter_t) > CubeSats(i).time(iter_cs)
+                        % Next time to save is from CubeSats
+                        CubeSat_times(counter) = CubeSats(i).time(iter_cs);
+                        CubeSat_positions(counter) = {CubeSats(i).centroids_VCF(:,iter_cs)};
+                        iter_cs = iter_cs + 1;
+                        counter = counter + 1;
+                    else
+                        % Times magically align perfectly
+                        CubeSat_times(counter) = t(iter_t);
+                        CubeSat_positions(counter) = pos(iter_t);
+                        iter_t = iter_t + 1;
+                        counter = counter + 1;
+                    end
+                end
+                
+                % For when MATLAB ignores the rest of the data after one of
+                % the indices reaches end
+                if iter_cs <= length(CubeSats(i).time)
+                    iter_init = iter_cs;
+                    for j = iter_init:length(CubeSats(i).time)
+                        CubeSat_times(counter) = CubeSats(i).time(iter_cs);
+                        CubeSat_positions(counter) = {CubeSats(i).centroids_VCF(:,iter_cs)};
+                        iter_cs = iter_cs + 1;
+                        counter = counter + 1;
+                    end
+                elseif iter_t <= length(t)
+                    iter_init = iter_t;
+                    for j = iter_init:length(t)
+                        CubeSat_times(counter) = t(iter_t);
+                        CubeSat_positions(counter) = positions(iter_t);
+                        iter_t = iter_t + 1;
+                        counter = counter + 1;
+                    end   
+                else
+                    continue
+                end
+                
+                this.Deployer.CubesatArray(i).centroids_VCF = CubeSat_positions;
+                this.Deployer.CubesatArray(i).time = CubeSat_times;
+            end
         end
         
         %
@@ -120,7 +288,7 @@ classdef Model < handle
         % A method for approximating a cubesat centroid using a weighted
         % centroiding method
         %
-        % @param      obj               The object
+        % @param      this               The object
         % @param      isSystemCentroid  Indicates if system centroid
         % @param      camOrigin         camera origin in the VANTAGE Cartesian
         %                               Frame
@@ -129,35 +297,34 @@ classdef Model < handle
         %                               VCF
         % @param      pos_TOF           VCF position estimates from the TOF
         %                               sensor suite
-        % @param      sig_cam           uncertainty in camera estimates in the
-        %                               VCF
-        % @param      sig_TOF           uncertainty in the TOF estimates in the
-        %                               VCF
         %
         % @return     pos       position estimate of cubesat centroids in the VCF
         %             frame using both sensor method returns
         %
-        function [pos] = RunSensorFusion(obj, isSystemCentroid, camOrigin, camVecs, pos_TOF, sig_cam, sig_TOF)
+        function [pos] = RunSensorFusion(this, isSystemCentroid, camOrigin, camVecs, pos_TOF)
 
         	% Initialize position cell array
-        	numCubesats = obj.Deployer.GetNumCubesats();
-        	pos = cell{numCubesats,1};
+        	numCubesats = this.Deployer.GetNumCubesats();
+        	pos = cell(numCubesats,1);
+            
+            if numel(camVecs)>1
+            end
 
         	% Perform sensor fusion
-        	if isSystemCentroid
+            if isSystemCentroid
 
         		% Find system centroid from TOF estimates
-        		meanTOF = zeros(1,3);
+        		meanTOF = zeros(3,1);
         		for i = 1:numCubesats
         			meanTOF = meanTOF + pos_TOF{i};
         		end
         		meanTOF = meanTOF./numCubesats;
 
         		% Run sensor fusion on system centroid estimates
-        		tmp = SensorFusion(obj, camOrigin, camVecs{1}, meanTOF, sig_cam, sig_TOF);
+        		tmp = SensorFusion(this, camOrigin, camVecs{end}', meanTOF);
 
         		% Calculate adjustment vector
-        		sensorFusionDiff = tmp-mean_TOF;
+        		sensorFusionDiff = tmp-meanTOF;
 
         		% Adjust TOF vectors to find new centroids
         		for i = 1:numCubesats
@@ -165,28 +332,37 @@ classdef Model < handle
         		end
         	else
         		% Loop through estimates individually and perform sensor fusion
-        		for i = 1:numCubesats
-        			pos{i} = SensorFusion(obj, camOrigin, camVecs{i}, pos_TOF{i}, sig_cam, sig_TOF);
-        		end
-    		end
-
+                for i = 1:numCubesats
+        			pos{i} = SensorFusion(this, camOrigin, camVecs{i}, pos_TOF{i});
+                end
+            end
         end
         
         % A method for approximating a cubesat centroid using a weighted
         % centroiding method
         %
-        % @param      obj        The object
+        % @param      this        The object
         % @param      camOrigin  camera origin in the VANTAGE Cartesian Frame
         % @param      camVec     vector pointing from camera origin to estimated
         %                        centroid in VCF
         % @param      pos_TOF    VCF position estimate from the TOF sensor suite
-        % @param      sig_cam    uncertainty in camera estimate in the VCF
-        % @param      sig_TOF    uncertainty in the TOF estimate in the VCF
         %
         % @return     pos       position estimate of cubesat centroid in the VCF
         %                       frame using both sensor method returns
         %
-        function [pos] = SensorFusion(obj, camOrigin, camVec, pos_TOF, sig_cam, sig_TOF)
+        function [pos] = SensorFusion(this, camOrigin, camVec, pos_TOF)
+            
+            % Make everything a column vector
+            if numel(camOrigin) > size(camOrigin,1)
+                camOrigin = camOrigin';
+            end
+            if numel(camVec) > size(camVec,1)
+                camVec = camVec';
+            end
+            if numel(pos_TOF) > size(pos_TOF,1)
+                pos_TOF = pos_TOF';
+            end
+            
             % Normalize camera vector
             camVec = camVec./norm(camVec);
 
@@ -198,6 +374,10 @@ classdef Model < handle
             
             % Calculate vector cross product
             vec = cross(a,b);
+            
+            % Calculate cam and TOF weights
+            sig_TOF = this.TOF.TofWeighting(norm(pos_TOF));
+            sig_cam = this.Optical.OpticalWeighting(norm(pos_TOF));
             
             % Calculate distance along line for weigthed center point
             d = norm(vec) / norm(a);
@@ -220,11 +400,11 @@ classdef Model < handle
         
         % I don't know what exactly this method is supposed to do
         %
-        % @param      obj   The object
+        % @param      this   The object
         %
         % @return     { description_of_the_return_value }
         %
-        function PredictionModel(obj)
+        function PredictionModel(~)
             
         end
         
@@ -233,8 +413,34 @@ classdef Model < handle
         % @param      sampleparameter sampledescription
         %
         % @return     samplereturn
-        function OutputStateVector(obj)
+        function OutputStateVector(~)
             
+        end
+
+        %% ransac line fitting for obfuscation
+        %
+        % This function uses the ransac algorithm to fit a line to noisy data
+        %
+        % @param      x            x coordinates to fit
+        % @param      y            y coordinates to fit
+        % @param      maxDistance  The maximum distance from the line
+        %
+        % @return     polyfit line
+        %
+        % @author       Justin Fay
+        % @date         21-Feb-2019
+        function p = ransacLine(this,x,y,maxDistance)
+            points = [x,y];
+            sampleSize = 2; % number of points to sample per trial
+
+            fitLineFcn = @(points) polyfit(points(:,1),points(:,2),1); % fit function using polyfit
+            evalLineFcn = ...   % distance evaluation function
+              @(model, points) sum((points(:, 2) - polyval(model, points(:,1))).^2,2);
+
+            [~, inlierIdx] = ransac(points,fitLineFcn,evalLineFcn, ...
+              sampleSize,maxDistance);
+          
+            p = polyfit(points(inlierIdx,1),points(inlierIdx,2),1);
         end
         
     end
@@ -250,15 +456,26 @@ classdef Model < handle
         %
         % @author   Joshua Kirby
         % @date     03-Mar-2019
-        function Truth = processTruthData(obj,truthFilename)
+        function Truth = processTruthData(this,truthFilename)
             % Read json truth file
             tmp = jsondecode(fileread(truthFilename));
+            
+            % extract date0
+            Truth = struct;
+            if strcmpi(this.Deployer.testScenario,'Simulation')
+                Truth.t0_datevec = datevec(tmp(1).t);
+            else
+                Truth.t0_datevec = datevec(tmp{1},this.TimeMan.TruthDateFormat);
+                tmp = tmp{2}; % reset tmp
+            end
+            
             
             % extract timesteps
             Truth.t = [tmp.t];
             
             % Order Cubesats [first-out to last-out]
             cubesatNamesUnordered = fieldnames(tmp(1).pos);
+            z = zeros(length(cubesatNamesUnordered),1);
             for i = 1:length(cubesatNamesUnordered)
                 z(i) = tmp(1).pos.(cubesatNamesUnordered{i})(3);
             end
@@ -268,7 +485,14 @@ classdef Model < handle
             % Extract cubesat position data in meters
             for i = 1:length(cubesatNames)
                 for j = 1:length(tmp)
-                    Truth.Cubesat(i).pos(j,:) = tmp(j).pos.(cubesatNames{i})./100;
+                    Truth.Cubesat(i).pos(j,:) = tmp(j).pos.(cubesatNames{i});
+                end
+                if strcmpi(this.Deployer.testScenario,'Simulation')
+                    Truth.Cubesat(i).pos = Truth.Cubesat(i).pos./100;
+                elseif strcmpi(this.Deployer.testScenario,'100m') || strcmpi(this.Deployer.testScenario,'Modular')
+                    % do nothing
+                else
+                    error('unhandled testScenario in Deployer object, must be ''100m'', ''Modular'', or ''Simulation''')
                 end
             end
             

@@ -30,7 +30,10 @@ classdef CubeSat
         numTOFpoints
         
         % Final 3D model fit to the TOF centroids, used for propagation
-        TOFfit
+        TOFfit_VCF
+        
+        % Range over which TOF centroiding was used
+        TOFrange
         
     end
     
@@ -45,16 +48,29 @@ classdef CubeSat
         %
         % @return     A reference to an initialized CubeSat object
         %
-        function obj = CubeSat(name, rangeOrder, expectedU, actualDims)
+        function this = CubeSat(name, rangeOrder, expectedU, actualDims)
             
-            TOFfit{1,3} = cfit;
+            TOFfit_VCF{1,3} = cfit;
             
             if nargin == 4
-                obj.name = name;
-                obj.rangeOrder = rangeOrder;
-                obj.expectedU = expectedU;
-                obj.actualDims = actualDims;
+                this.name = name;
+                this.rangeOrder = rangeOrder;
+                this.expectedU = expectedU;
+                this.actualDims = actualDims;
             end
+        end
+        
+        %
+        % Evaluate TOFfit_VCF at some time
+        %
+        % @param    t   time at which to evaluate fit
+        %
+        % @return   TOF predicted centroid in VCF
+        %
+        % @author   Joshua Kirby
+        % @date     06-Apr-2019
+        function centroid_TofPredicted_VCF = evalTofFit(this,t)
+            centroid_TofPredicted_VCF = cellfun(@(x) feval(x,t),this.TOFfit_VCF)';
         end
     end
     
